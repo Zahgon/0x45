@@ -1,11 +1,14 @@
 package testutils
 
 import (
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/watzon/0x45/internal/config"
 	"github.com/watzon/0x45/internal/database"
 	"github.com/watzon/0x45/internal/models"
@@ -15,7 +18,7 @@ import (
 )
 
 type TestEnv struct {
-	App       *fiber.App
+	App       http.Handler
 	Server    *server.Server
 	DB        *database.Database
 	Config    *config.Config
@@ -37,6 +40,11 @@ func SetupTestEnv(t *testing.T) *TestEnv {
 	// Create views directory and copy templates if needed
 	viewsDir := filepath.Join(tempDir, "views")
 	if err := os.MkdirAll(viewsDir, 0755); err != nil {
+		os.RemoveAll(tempDir)
+		t.Fatal(err)
+	}
+
+	if err := copyViews(viewsDir); err != nil {
 		os.RemoveAll(tempDir)
 		t.Fatal(err)
 	}
@@ -116,7 +124,7 @@ func SetupTestEnv(t *testing.T) *TestEnv {
 	}
 
 	return &TestEnv{
-		App:       srv.GetApp(),
+		App:       srv.Handler(),
 		Server:    srv,
 		DB:        srv.GetDB(),
 		Config:    &origCfg,
@@ -124,5 +132,74 @@ func SetupTestEnv(t *testing.T) *TestEnv {
 		Logger:    logger,
 		TempDir:   tempDir,
 		CleanupFn: cleanup,
+	}
+}
+
+// Request serves req through the application handler and returns the recorded
+// response. Fiber offered app.Test for this; gin is plain net/http, so the
+// request goes through httptest instead. The error return keeps the call sites
+// shaped like the http.Client contract the tests were written against.
+func (e *TestEnv) Request(req *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	e.App.ServeHTTP(rec, req)
+	return rec.Result(), nil
+}
+
+// copyViews mirrors the repository views directory into dst. The template
+// engine requires a populated primary views directory, and its "./views"
+// fallback resolves relative to the test package rather than the repo root.
+func copyViews(dst string) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+
+	src := filepath.Join(root, "views")
+	return filepath.Walk(src, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+
+		buf, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, buf, 0644)
+	})
+}
+
+// RepoRoot exposes the module root so a suite can run from it. Parts of the
+// application resolve asset paths against the process working directory.
+func RepoRoot() (string, error) {
+	return repoRoot()
+}
+
+// repoRoot walks up from the working directory until it finds the module root.
+func repoRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("could not locate module root from %s", dir)
+		}
+		dir = parent
 	}
 }

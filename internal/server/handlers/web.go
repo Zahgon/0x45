@@ -6,11 +6,13 @@ import (
 	"regexp"
 
 	"github.com/dustin/go-humanize"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
 	"github.com/watzon/0x45/internal/config"
 	"github.com/watzon/0x45/internal/server/services"
+	"github.com/watzon/0x45/internal/server/template"
 	"github.com/watzon/0x45/internal/utils"
-	"go.uber.org/zap"
 )
 
 type WebHandlers struct {
@@ -34,7 +36,7 @@ func (h *WebHandlers) getBaseURLHost() string {
 }
 
 // HandleIndex serves the main web interface page
-func (h *WebHandlers) HandleIndex(c *fiber.Ctx) error {
+func (h *WebHandlers) HandleIndex(c *gin.Context) error {
 	h.logger.Debug("generating retention data for index page")
 	retentionStats, err := utils.GenerateRetentionData(int64(h.config.Server.MaxUploadSize), h.config)
 	if err != nil {
@@ -58,8 +60,8 @@ func (h *WebHandlers) HandleIndex(c *fiber.Ctx) error {
 		zap.String("baseUrlHost", h.getBaseURLHost()),
 		zap.Any("retention", retentionStats))
 
-	err = c.Render("index", fiber.Map{
-		"retention": fiber.Map{
+	err = template.Render(c, "index", gin.H{
+		"retention": gin.H{
 			"noKey":          retentionStats.NoKeyRange,
 			"withKey":        retentionStats.WithKeyRange,
 			"minAge":         h.config.Retention.NoKey.MinAge,
@@ -85,13 +87,13 @@ func (h *WebHandlers) HandleIndex(c *fiber.Ctx) error {
 }
 
 // HandleStats serves the statistics page
-func (h *WebHandlers) HandleStats(c *fiber.Ctx) error {
+func (h *WebHandlers) HandleStats(c *gin.Context) error {
 	stats, err := h.services.Stats.GetSystemStats()
 	if err != nil {
 		return err
 	}
 
-	return c.Render("stats", fiber.Map{
+	return template.Render(c, "stats", gin.H{
 		"stats":       stats,
 		"baseUrlHost": h.getBaseURLHost(),
 		"baseUrl":     h.config.Server.BaseURL,
@@ -99,23 +101,23 @@ func (h *WebHandlers) HandleStats(c *fiber.Ctx) error {
 }
 
 // HandleDocs serves the API documentation page
-func (h *WebHandlers) HandleDocs(c *fiber.Ctx) error {
+func (h *WebHandlers) HandleDocs(c *gin.Context) error {
 	retentionStats, err := utils.GenerateRetentionData(int64(h.config.Server.MaxUploadSize), h.config)
 	if err != nil {
 		h.logger.Error("failed to generate retention data", zap.Error(err))
 	}
 
-	return c.Render("docs", fiber.Map{
+	return template.Render(c, "docs", gin.H{
 		"baseUrlHost":    h.getBaseURLHost(),
 		"baseUrl":        h.config.Server.BaseURL,
 		"apiKeysEnabled": h.services.APIKey.IsEnabled(),
-		"retention": fiber.Map{
+		"retention": gin.H{
 			"noKey":   retentionStats.NoKeyRange,
 			"withKey": retentionStats.WithKeyRange,
 			"minAge":  h.config.Retention.NoKey.MinAge,
 			"maxAge":  h.config.Retention.WithKey.MaxAge,
 		},
-		"rateLimits": fiber.Map{
+		"rateLimits": gin.H{
 			"global": fmt.Sprintf("%.0f/s", h.config.Server.RateLimit.Global.Rate),
 			"perIP":  fmt.Sprintf("%.0f/s", h.config.Server.RateLimit.PerIP.Rate),
 		},
@@ -124,8 +126,8 @@ func (h *WebHandlers) HandleDocs(c *fiber.Ctx) error {
 }
 
 // HandleSubmit serves the paste submission page
-func (h *WebHandlers) HandleSubmit(c *fiber.Ctx) error {
-	return c.Render("submit", fiber.Map{
+func (h *WebHandlers) HandleSubmit(c *gin.Context) error {
+	return template.Render(c, "submit", gin.H{
 		"baseUrlHost": h.getBaseURLHost(),
 		"baseUrl":     h.config.Server.BaseURL,
 	}, "layouts/main")

@@ -3,24 +3,28 @@ package services
 import (
 	"io"
 	"mime/multipart"
+	"net/http"
 
 	"github.com/gabriel-vasile/mimetype"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gin-gonic/gin"
+
+	"github.com/watzon/0x45/internal/httperr"
+	"github.com/watzon/0x45/internal/server/binding"
 )
 
 // RequestParser handles unified request parsing for different content types
 type RequestParser struct {
-	ctx *fiber.Ctx
+	ctx *gin.Context
 }
 
 // NewRequestParser creates a new RequestParser instance
-func NewRequestParser(c *fiber.Ctx) *RequestParser {
+func NewRequestParser(c *gin.Context) *RequestParser {
 	return &RequestParser{ctx: c}
 }
 
 // ParseUploadRequest parses various types of upload requests into a unified format
 func (p *RequestParser) ParseUploadRequest() (*UploadRequest, error) {
-	contentType := p.ctx.Get("Content-Type")
+	contentType := p.ctx.GetHeader("Content-Type")
 
 	// Handle multipart form uploads
 	if form, err := p.ctx.MultipartForm(); err == nil {
@@ -38,8 +42,8 @@ func (p *RequestParser) ParseUploadRequest() (*UploadRequest, error) {
 
 // ParseJSON attempts to parse the request body as JSON into the provided struct
 func (p *RequestParser) ParseJSON(out interface{}) error {
-	if err := p.ctx.BodyParser(out); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "Invalid JSON payload")
+	if err := binding.Body(p.ctx, out); err != nil {
+		return httperr.New(http.StatusBadRequest, "Invalid JSON payload")
 	}
 	return nil
 }
@@ -52,33 +56,33 @@ func (p *RequestParser) parseMultipartUpload(form *multipart.Form) (*UploadReque
 	if len(form.File["file"]) > 0 {
 		file = form.File["file"][0]
 	} else {
-		return nil, fiber.NewError(fiber.StatusBadRequest, "No file provided")
+		return nil, httperr.New(http.StatusBadRequest, "No file provided")
 	}
 
 	// Open and read file
 	f, err := file.Open()
 	if err != nil {
-		return nil, fiber.NewError(fiber.StatusInternalServerError, "Failed to open uploaded file")
+		return nil, httperr.New(http.StatusInternalServerError, "Failed to open uploaded file")
 	}
 	defer f.Close()
 
 	content, err := io.ReadAll(f)
 	if err != nil {
-		return nil, fiber.NewError(fiber.StatusInternalServerError, "Failed to read file content")
+		return nil, httperr.New(http.StatusInternalServerError, "Failed to read file content")
 	}
 
 	// Check for empty content
 	if len(content) == 0 {
-		return nil, fiber.NewError(fiber.StatusBadRequest, "Empty file")
+		return nil, httperr.New(http.StatusBadRequest, "Empty file")
 	}
 
 	// Get other form values
 	return &UploadRequest{
 		Content:     content,
 		Filename:    file.Filename,
-		Extension:   p.ctx.FormValue("extension", ""),
-		ExpiresIn:   p.ctx.FormValue("expires_in", ""),
-		Private:     p.ctx.FormValue("private") == "true",
+		Extension:   p.ctx.DefaultPostForm("extension", ""),
+		ExpiresIn:   p.ctx.DefaultPostForm("expires_in", ""),
+		Private:     p.ctx.PostForm("private") == "true",
 		ContentType: file.Header.Get("Content-Type"),
 	}, nil
 }
@@ -110,7 +114,7 @@ func (p *RequestParser) parseJSONUpload() (*UploadRequest, error) {
 
 	// Otherwise, expect content in the request
 	if req.Content == "" {
-		return nil, fiber.NewError(fiber.StatusBadRequest, "Content or URL is required")
+		return nil, httperr.New(http.StatusBadRequest, "Content or URL is required")
 	}
 
 	content := []byte(req.Content)
@@ -127,21 +131,21 @@ func (p *RequestParser) parseJSONUpload() (*UploadRequest, error) {
 }
 
 func (p *RequestParser) parseRawUpload() (*UploadRequest, error) {
-	content := p.ctx.Body()
-	if len(content) == 0 {
-		return nil, fiber.NewError(fiber.StatusBadRequest, "Empty request body")
+	content, err := binding.ReadBody(p.ctx)
+	if err != nil || len(content) == 0 {
+		return nil, httperr.New(http.StatusBadRequest, "Empty request body")
 	}
 
 	mime := mimetype.Detect(content)
-	filename := p.ctx.Get("X-Filename", "")
-	extension := p.ctx.Get("X-Extension", "")
+	filename := p.ctx.GetHeader("X-Filename")
+	extension := p.ctx.GetHeader("X-Extension")
 
 	return &UploadRequest{
 		Content:     content,
 		Filename:    filename,
 		Extension:   extension,
-		ExpiresIn:   p.ctx.Get("X-Expires-In", ""),
-		Private:     p.ctx.Get("X-Private") == "true",
+		ExpiresIn:   p.ctx.GetHeader("X-Expires-In"),
+		Private:     p.ctx.GetHeader("X-Private") == "true",
 		ContentType: mime.String(),
 	}, nil
 }

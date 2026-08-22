@@ -5,11 +5,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/watzon/0x45/internal/config"
-	"github.com/watzon/0x45/internal/models"
+	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+
+	"github.com/watzon/0x45/internal/config"
+	"github.com/watzon/0x45/internal/models"
 )
 
 type StatsService struct {
@@ -29,7 +30,7 @@ func NewStatsService(db *gorm.DB, logger *zap.Logger, config *config.Config) *St
 }
 
 // GetSystemStats returns current system statistics and historical data
-func (s *StatsService) GetSystemStats() (fiber.Map, error) {
+func (s *StatsService) GetSystemStats() (gin.H, error) {
 	// Get current stats
 	var totalPastes, totalUrls int64
 	s.db.Model(&models.Paste{}).Count(&totalPastes)
@@ -129,8 +130,8 @@ func (s *StatsService) GetSystemStats() (fiber.Map, error) {
 	// Format the private ratio to 2 decimal places
 	formattedPrivateRatio := float64(int(privateRatio*100)) / 100
 
-	return fiber.Map{
-		"current": fiber.Map{
+	return gin.H{
+		"current": gin.H{
 			"pastes":         totalPastes,
 			"urls":           totalUrls,
 			"storage":        totalStorage,
@@ -141,21 +142,21 @@ func (s *StatsService) GetSystemStats() (fiber.Map, error) {
 			"expiringPastes": expiringPastes,
 			"expiringUrls":   expiringUrls,
 		},
-		"history": fiber.Map{
+		"history": gin.H{
 			"pastes":  string(pastesHistory),
 			"urls":    string(urlsHistory),
 			"storage": string(storageHistory),
 		},
-		"storage": fiber.Map{
+		"storage": gin.H{
 			"byType":  string(storageByTypeJSON),
 			"avgSize": avgSize,
 		},
 		"extensions": extensionStats,
-		"expiring": fiber.Map{
+		"expiring": gin.H{
 			"pastes": expiringPastes,
 			"urls":   expiringUrls,
 		},
-		"privacy": fiber.Map{
+		"privacy": gin.H{
 			"private":      privatePastes,
 			"public":       publicPastes,
 			"privateRatio": formattedPrivateRatio,

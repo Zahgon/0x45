@@ -166,7 +166,7 @@ func TestMultipartPasteUpload(t *testing.T) {
 			}
 
 			// Perform request
-			resp, err := env.App.Test(req)
+			resp, err := env.Request(req)
 			require.NoError(t, err)
 
 			// If we got an unexpected status code, let's log the response body
@@ -276,7 +276,7 @@ func TestJSONPasteUpload(t *testing.T) {
 			}
 
 			// Perform request
-			resp, err := env.App.Test(req)
+			resp, err := env.Request(req)
 			require.NoError(t, err)
 
 			// If we got an unexpected status code, let's log the response body
@@ -369,7 +369,7 @@ func TestPasteWithExpiresIn(t *testing.T) {
 			beforeRequest := time.Now()
 
 			// Perform request
-			resp, err := env.App.Test(req)
+			resp, err := env.Request(req)
 			require.NoError(t, err)
 
 			// If we got an unexpected status code, let's log the response body

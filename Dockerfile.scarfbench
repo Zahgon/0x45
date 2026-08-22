@@ -1,0 +1,27 @@
+# ScarfBench container for the SOURCE variant (Go / Fiber 2.52).
+# Single container, no external services: SQLite + local disk storage.
+FROM golang:1.23 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/app . && mkdir -p /out/datadir
+
+FROM gcr.io/distroless/base-debian12
+WORKDIR /app
+COPY --from=build /out/datadir /app/data
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /out/app /app/app
+COPY views ./views
+COPY public ./public
+# Deterministic runtime for the oracle: SQLite + local disk, no Redis/SMTP/S3,
+# fixed base_url, per-IP rate limiting relaxed so smoke tests don't hit 429.
+ENV 0X_SERVER_BASE_URL=http://localhost:3000 \
+    0X_DATABASE_DRIVER=sqlite \
+    0X_DATABASE_NAME=/app/data/paste69.db \
+    0X_REDIS_ENABLED=false \
+    0X_SMTP_ENABLED=false \
+    0X_SERVER_RATE_LIMIT_PER_IP_ENABLED=false \
+    0X_SERVER_RATE_LIMIT_GLOBAL_ENABLED=false
+EXPOSE 3000
+CMD ["/app/app"]

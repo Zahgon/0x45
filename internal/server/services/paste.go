@@ -8,23 +8,30 @@ import (
 	_ "image/jpeg" // Register JPEG format
 	"image/png"
 	"io"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/watzon/0x45/internal/server/respond"
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/gabriel-vasile/mimetype"
-	"github.com/gofiber/fiber/v2"
-	"github.com/watzon/0x45/internal/config"
-	"github.com/watzon/0x45/internal/models"
-	"github.com/watzon/0x45/internal/storage"
-	"github.com/watzon/0x45/internal/utils"
+	"github.com/gin-gonic/gin"
 	"github.com/watzon/hdur"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+
+	"github.com/watzon/0x45/internal/config"
+	"github.com/watzon/0x45/internal/httperr"
+	"github.com/watzon/0x45/internal/models"
+	"github.com/watzon/0x45/internal/server/binding"
+	"github.com/watzon/0x45/internal/server/template"
+	"github.com/watzon/0x45/internal/storage"
+	"github.com/watzon/0x45/internal/utils"
 )
 
 type PasteService struct {
@@ -46,29 +53,33 @@ func NewPasteService(db *gorm.DB, logger *zap.Logger, config *config.Config) *Pa
 }
 
 // CreatePaste handles the creation of a new paste
-func (s *PasteService) UploadPaste(c *fiber.Ctx) error {
+func (s *PasteService) UploadPaste(c *gin.Context) error {
+	rawBody, _ := binding.ReadBody(c)
 	s.logger.Debug("Received upload request",
-		zap.String("content-type", c.Get("Content-Type")),
-		zap.String("body", string(c.Body())))
+		zap.String("content-type", c.GetHeader("Content-Type")),
+		zap.String("body", string(rawBody)))
 
 	p := new(PasteOptions)
-	contentType := c.Get("Content-Type")
+	contentType := c.GetHeader("Content-Type")
 
 	// Handle form data differently from JSON/other formats
 	if strings.Contains(contentType, "multipart/form-data") || strings.Contains(contentType, "application/x-www-form-urlencoded") {
-		// Parse form values
-		if err := c.BodyParser(p); err != nil {
+		// Parse form values. A field that fails to convert is reported but does
+		// not abort the upload: the source decoder collected per-field errors
+		// and still populated the rest, so rejecting here would change the
+		// response for inputs the original accepted.
+		if err := binding.Body(c, p); err != nil {
 			s.logger.Error("Failed to parse form values",
 				zap.Error(err))
 		}
 	} else {
 		// For JSON and other formats
-		if err := c.BodyParser(p); err != nil {
+		if err := binding.Body(c, p); err != nil {
 			s.logger.Error("Failed to parse request body",
 				zap.Error(err),
-				zap.String("content-type", c.Get("Content-Type")),
-				zap.String("body", string(c.Body())))
-			return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
+				zap.String("content-type", c.GetHeader("Content-Type")),
+				zap.String("body", string(rawBody)))
+			return httperr.New(http.StatusBadRequest, "Invalid request body")
 		}
 	}
 
@@ -82,17 +93,17 @@ func (s *PasteService) UploadPaste(c *fiber.Ctx) error {
 		// Read file content
 		f, err := file.Open()
 		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "Failed to open uploaded file")
+			return httperr.New(http.StatusInternalServerError, "Failed to open uploaded file")
 		}
 		defer f.Close()
 
 		content, err = io.ReadAll(f)
 		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "Failed to read file content")
+			return httperr.New(http.StatusInternalServerError, "Failed to read file content")
 		}
 
 		// First check for a filename in form field
-		if formFilename := c.FormValue("filename"); formFilename != "" {
+		if formFilename := c.PostForm("filename"); formFilename != "" {
 			filename = formFilename
 		} else if file.Filename != "" && file.Filename != "-" { // Don't use "-" as filename
 			filename = file.Filename
@@ -103,7 +114,7 @@ func (s *PasteService) UploadPaste(c *fiber.Ctx) error {
 		// Read content from the given URL
 		content, err = utils.GetContentFromURL(p.URL)
 		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "Failed to fetch URL")
+			return httperr.New(http.StatusBadRequest, "Failed to fetch URL")
 		}
 
 		// Try to get filename from URL if not explicitly provided
@@ -114,12 +125,12 @@ func (s *PasteService) UploadPaste(c *fiber.Ctx) error {
 		// Use content from the request body
 		content = []byte(p.Content)
 	} else {
-		return fiber.NewError(fiber.StatusBadRequest, "No file provided")
+		return httperr.New(http.StatusBadRequest, "No file provided")
 	}
 
 	// Check for empty content
 	if len(content) == 0 {
-		return fiber.NewError(fiber.StatusBadRequest, "Empty file")
+		return httperr.New(http.StatusBadRequest, "Empty file")
 	}
 
 	// If we found a filename and none was provided in the request, use it
@@ -128,13 +139,13 @@ func (s *PasteService) UploadPaste(c *fiber.Ctx) error {
 	}
 
 	var apiKey *models.APIKey
-	if key := c.Locals("apiKey"); key != nil {
+	if key, ok := c.Get("apiKey"); ok && key != nil {
 		apiKey = key.(*models.APIKey)
 	}
 
 	// Check if the user is attempting to do something they're not allowed to do
 	if p.Private && apiKey == nil {
-		return fiber.NewError(fiber.StatusUnauthorized, "Private pastes can only be created with an API key")
+		return httperr.New(http.StatusUnauthorized, "Private pastes can only be created with an API key")
 	}
 
 	// Create the paste
@@ -156,21 +167,24 @@ func (s *PasteService) UploadPaste(c *fiber.Ctx) error {
 	}
 
 	// If this is a browser form submission, redirect to the paste view
-	acceptHeader := c.Get("Accept")
+	acceptHeader := c.GetHeader("Accept")
 	if strings.Contains(acceptHeader, "text/html") {
 		// Store the deletion URL in the session for display after redirect
-		c.Cookie(&fiber.Cookie{
+		http.SetCookie(c.Writer, &http.Cookie{
 			Name:     "deletion_url",
 			Value:    response.DeleteURL,
 			Path:     "/",
 			Expires:  time.Now().Add(5 * time.Minute),
-			HTTPOnly: true,
+			HttpOnly: true,
 		})
-		return c.Redirect(response.URL)
+		c.Header("Location", response.URL)
+		c.Status(http.StatusFound)
+		return nil
 	}
 
 	// For API requests, return JSON response
-	return c.JSON(response)
+	respond.JSON(c, http.StatusOK, response)
+	return nil
 }
 
 // GetPaste retrieves a paste by ID with expiry checking
@@ -184,7 +198,7 @@ func (s *PasteService) GetPaste(id string) (*models.Paste, error) {
 	err := s.db.Where("id = ? AND (expires_at IS NULL OR expires_at > ?)", id, time.Now()).First(&paste).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
-			return nil, fiber.NewError(fiber.StatusNotFound, "Paste not found or expired")
+			return nil, httperr.New(http.StatusNotFound, "Paste not found or expired")
 		}
 		return nil, err
 	}
@@ -192,7 +206,7 @@ func (s *PasteService) GetPaste(id string) (*models.Paste, error) {
 }
 
 // GetPasteImage returns an image of the paste suitable for Open Graph
-func (s *PasteService) GetPasteImage(c *fiber.Ctx, paste *models.Paste) error {
+func (s *PasteService) GetPasteImage(c *gin.Context, paste *models.Paste) error {
 	// Get the content
 	content, err := s.storage.Get(paste.StoragePath)
 	if err != nil {
@@ -264,13 +278,13 @@ func (s *PasteService) GetPasteImage(c *fiber.Ctx, paste *models.Paste) error {
 		imageBytes = buf.Bytes()
 	}
 
-	c.Set("Cache-Control", "max-age=31536000, immutable")
-	c.Set("Content-Type", "image/png")
-	return c.Send(imageBytes)
+	c.Header("Cache-Control", "max-age=31536000, immutable")
+	c.Data(http.StatusOK, "image/png", imageBytes)
+	return nil
 }
 
 // RenderPaste renders the paste view for text content
-func (s *PasteService) RenderPaste(c *fiber.Ctx, paste *models.Paste) error {
+func (s *PasteService) RenderPaste(c *gin.Context, paste *models.Paste) error {
 	content, err := s.storage.Get(paste.StoragePath)
 	if err != nil {
 		return err
@@ -278,14 +292,14 @@ func (s *PasteService) RenderPaste(c *fiber.Ctx, paste *models.Paste) error {
 
 	// Check for deletion URL cookie
 	var deletionUrl string
-	if cookie := c.Cookies("deletion_url"); cookie != "" {
+	if cookie, err := c.Cookie("deletion_url"); err == nil && cookie != "" {
 		// Clear the cookie before reading it to ensure one-time use
-		c.Cookie(&fiber.Cookie{
+		http.SetCookie(c.Writer, &http.Cookie{
 			Name:     "deletion_url",
 			Value:    "",
 			Path:     "/",
 			Expires:  time.Now().Add(-24 * time.Hour),
-			HTTPOnly: true,
+			HttpOnly: true,
 		})
 		deletionUrl = cookie
 	}
@@ -293,15 +307,15 @@ func (s *PasteService) RenderPaste(c *fiber.Ctx, paste *models.Paste) error {
 	// Set cache headers
 	if deletionUrl != "" {
 		// Only set no-cache headers if we have a deletion URL
-		c.Set("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0")
-		c.Set("Pragma", "no-cache")
-		c.Set("Expires", "0")
-		c.Set("CDN-Cache-Control", "no-store")
-		c.Set("Cloudflare-CDN-Cache-Control", "no-store")
+		c.Header("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0")
+		c.Header("Pragma", "no-cache")
+		c.Header("Expires", "0")
+		c.Header("CDN-Cache-Control", "no-store")
+		c.Header("Cloudflare-CDN-Cache-Control", "no-store")
 	} else {
 		// If no deletion URL, content is immutable and can be cached
-		c.Set("Cache-Control", "public, max-age=31536000, immutable")
-		c.Set("ETag", paste.ID)
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Header("ETag", paste.ID)
 	}
 
 	var renderedContent string
@@ -320,7 +334,7 @@ func (s *PasteService) RenderPaste(c *fiber.Ctx, paste *models.Paste) error {
 		pasteID = paste.ID + "." + paste.Extension
 	}
 
-	return c.Render("paste", fiber.Map{
+	return template.Render(c, "paste", gin.H{
 		"isPaste":     true,
 		"id":          pasteID,
 		"filename":    paste.Filename,
@@ -332,7 +346,7 @@ func (s *PasteService) RenderPaste(c *fiber.Ctx, paste *models.Paste) error {
 		"rawContent":  string(content),
 		"baseUrl":     s.config.Server.BaseURL,
 		"deletionUrl": deletionUrl,
-		"metadata": fiber.Map{
+		"metadata": gin.H{
 			"size":      formatSize(paste.Size),
 			"mimeType":  paste.MimeType,
 			"createdAt": paste.CreatedAt,
@@ -405,21 +419,21 @@ func (s *PasteService) renderHighlightedText(content, extension, mimeType string
 }
 
 // RenderPasteRaw serves the raw content with proper content type
-func (s *PasteService) RenderPasteRaw(c *fiber.Ctx, paste *models.Paste) error {
+func (s *PasteService) RenderPasteRaw(c *gin.Context, paste *models.Paste) error {
 	content, err := s.storage.Get(paste.StoragePath)
 	if err != nil {
 		return err
 	}
-	c.Set("Content-Type", paste.MimeType)
 	// Add permanent cache headers since content is immutable
-	c.Set("Cache-Control", "public, max-age=31536000, immutable")
-	c.Set("ETag", paste.ID)
-	return c.Send(content)
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("ETag", paste.ID)
+	c.Data(http.StatusOK, paste.MimeType, content)
+	return nil
 }
 
 // RenderPasteJSON serves the paste as JSON. If the paste is text, the content will be included
 // in the response. Otherwise only the URL will be included for downloading purposes.
-func (s *PasteService) RenderPasteJSON(c *fiber.Ctx, paste *models.Paste) error {
+func (s *PasteService) RenderPasteJSON(c *gin.Context, paste *models.Paste) error {
 	pasteJson := struct {
 		ID       string `json:"id"`
 		Filename string `json:"filename"`
@@ -441,29 +455,31 @@ func (s *PasteService) RenderPasteJSON(c *fiber.Ctx, paste *models.Paste) error 
 		pasteJson.Content = string(content)
 	}
 
-	return c.JSON(pasteJson)
+	respond.JSON(c, http.StatusOK, pasteJson)
+
+	return nil
 }
 
 // RenderDownload serves the content as a downloadable file
-func (s *PasteService) RenderDownload(c *fiber.Ctx, paste *models.Paste) error {
+func (s *PasteService) RenderDownload(c *gin.Context, paste *models.Paste) error {
 	content, err := s.storage.Get(paste.StoragePath)
 	if err != nil {
 		return err
 	}
 
-	c.Set("Content-Type", "application/octet-stream")
-	c.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, paste.Filename))
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, paste.Filename))
 	// Add permanent cache headers since content is immutable
-	c.Set("Cache-Control", "public, max-age=31536000, immutable")
-	c.Set("ETag", paste.ID)
-	return c.Send(content)
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Header("ETag", paste.ID)
+	c.Data(http.StatusOK, "application/octet-stream", content)
+	return nil
 }
 
 // DeleteWithKey deletes a paste using its deletion key
-func (s *PasteService) DeleteWithKey(c *fiber.Ctx, id string) error {
-	key := c.Params("key") // Get key from URL path instead of query
+func (s *PasteService) DeleteWithKey(c *gin.Context, id string) error {
+	key := c.Param("key") // Get key from URL path instead of query
 	if key == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "Deletion key is required")
+		return httperr.New(http.StatusBadRequest, "Deletion key is required")
 	}
 
 	// Strip any extension from the ID
@@ -478,40 +494,42 @@ func (s *PasteService) DeleteWithKey(c *fiber.Ctx, id string) error {
 	}
 
 	if paste.DeleteKey != key {
-		return fiber.NewError(fiber.StatusUnauthorized, "Invalid deletion key")
+		return httperr.New(http.StatusUnauthorized, "Invalid deletion key")
 	}
 
 	// For DELETE requests, delete the paste
-	if c.Method() == fiber.MethodDelete {
+	if c.Request.Method == http.MethodDelete {
 		if err := s.Delete(c, id); err != nil {
 			return err
 		}
 
 		// Return appropriate response based on Accept header
-		if strings.Contains(c.Get("Accept"), "application/json") {
-			return c.JSON(fiber.Map{
+		if strings.Contains(c.GetHeader("Accept"), "application/json") {
+			respond.JSON(c, http.StatusOK, gin.H{
 				"message": "Paste deleted successfully",
 				"id":      id,
 			})
+			return nil
 		}
 
 		// For HTML requests, render the success page
-		return c.Render("delete_success", fiber.Map{
+		return template.Render(c, "delete_success", gin.H{
 			"isDeleteSuccess": true,
 			"baseUrl":         s.config.Server.BaseURL,
 		}, "layouts/main")
 	}
 
 	// For GET requests, show a confirmation page
-	if strings.Contains(c.Get("Accept"), "application/json") {
-		return c.JSON(fiber.Map{
+	if strings.Contains(c.GetHeader("Accept"), "application/json") {
+		respond.JSON(c, http.StatusOK, gin.H{
 			"message": "Paste found and will be deleted",
 			"id":      id,
 		})
+		return nil
 	}
 
 	// For HTML requests, render the confirmation page
-	return c.Render("delete_confirm", fiber.Map{
+	return template.Render(c, "delete_confirm", gin.H{
 		"isDeleteConfirm": true,
 		"baseUrl":         s.config.Server.BaseURL,
 		"pasteId":         id,
@@ -520,7 +538,7 @@ func (s *PasteService) DeleteWithKey(c *fiber.Ctx, id string) error {
 }
 
 // Delete removes a paste and its associated files
-func (s *PasteService) Delete(c *fiber.Ctx, id string) error {
+func (s *PasteService) Delete(c *gin.Context, id string) error {
 	// Strip any extension from the ID
 	if idx := strings.LastIndex(id, "."); idx != -1 {
 		id = id[:idx]
@@ -539,8 +557,8 @@ func (s *PasteService) Delete(c *fiber.Ctx, id string) error {
 }
 
 // ListPastes returns a paginated list of pastes for the API key
-func (s *PasteService) ListPastes(c *fiber.Ctx) error {
-	apiKey := c.Locals("apiKey").(*models.APIKey)
+func (s *PasteService) ListPastes(c *gin.Context) error {
+	apiKey := c.MustGet("apiKey").(*models.APIKey)
 
 	var pastes []models.Paste
 	query := s.db.Where("api_key = ?", apiKey.Key)
@@ -561,11 +579,12 @@ func (s *PasteService) ListPastes(c *fiber.Ctx) error {
 
 	// Convert pastes to response format
 	respose := NewListPastesResponse(pastes, s.config.Server.BaseURL)
-	return c.JSON(respose)
+	respond.JSON(c, http.StatusOK, respose)
+	return nil
 }
 
 // UpdateExpiration updates a paste's expiration time
-func (s *PasteService) UpdateExpiration(c *fiber.Ctx, id string) error {
+func (s *PasteService) UpdateExpiration(c *gin.Context, id string) error {
 	// Strip any extension from the ID
 	if idx := strings.LastIndex(id, "."); idx != -1 {
 		id = id[:idx]
@@ -577,8 +596,8 @@ func (s *PasteService) UpdateExpiration(c *fiber.Ctx, id string) error {
 	}
 
 	req := new(UpdatePasteExpirationRequest)
-	if err := c.BodyParser(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
+	if err := binding.Body(c, &req); err != nil {
+		return httperr.New(http.StatusBadRequest, "Invalid request body")
 	}
 
 	expiryTime, err := s.calculateExpiry(ExpiryOptions{
@@ -598,7 +617,8 @@ func (s *PasteService) UpdateExpiration(c *fiber.Ctx, id string) error {
 
 	// Build response
 	response := NewPasteResponse(paste, s.config.Server.BaseURL)
-	return c.JSON(response)
+	respond.JSON(c, http.StatusOK, response)
+	return nil
 }
 
 // CleanupExpired removes expired pastes and their associated files
@@ -660,17 +680,17 @@ func (s *PasteService) CleanupExpired() (int64, error) {
 func (s *PasteService) validateFileSize(size int64, apiKey *models.APIKey) error {
 	// First check against absolute maximum size for security
 	if size > int64(s.config.Server.MaxUploadSize) {
-		return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("File exceeds maximum allowed size of %d bytes", s.config.Server.MaxUploadSize))
+		return httperr.New(http.StatusBadRequest, fmt.Sprintf("File exceeds maximum allowed size of %d bytes", s.config.Server.MaxUploadSize))
 	}
 
 	// Then check against the appropriate tier limit
 	if apiKey != nil {
 		if size > int64(s.config.Server.APIUploadSize) {
-			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("File exceeds API upload limit of %d bytes", s.config.Server.APIUploadSize))
+			return httperr.New(http.StatusBadRequest, fmt.Sprintf("File exceeds API upload limit of %d bytes", s.config.Server.APIUploadSize))
 		}
 	} else {
 		if size > int64(s.config.Server.DefaultUploadSize) {
-			return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("File exceeds default upload limit of %d bytes", s.config.Server.DefaultUploadSize))
+			return httperr.New(http.StatusBadRequest, fmt.Sprintf("File exceeds default upload limit of %d bytes", s.config.Server.DefaultUploadSize))
 		}
 	}
 
@@ -681,7 +701,7 @@ func (s *PasteService) createPaste(content io.Reader, apiKey *models.APIKey, siz
 	// Read content for MIME type detection
 	contentBytes, err := io.ReadAll(content)
 	if err != nil {
-		return nil, fiber.NewError(fiber.StatusInternalServerError, "Failed to read content")
+		return nil, httperr.New(http.StatusInternalServerError, "Failed to read content")
 	}
 
 	// Check file size against limit either globally or per API key
@@ -739,7 +759,7 @@ func (s *PasteService) createPaste(content io.Reader, apiKey *models.APIKey, siz
 		ExpiresAt: opts.ExpiresAt,
 	})
 	if err != nil {
-		return nil, fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return nil, httperr.New(http.StatusBadRequest, err.Error())
 	}
 	paste.ExpiresAt = expiry
 
@@ -761,12 +781,12 @@ func (s *PasteService) createPaste(content io.Reader, apiKey *models.APIKey, siz
 		}
 
 		if paste.StorageName == "" {
-			return fiber.NewError(fiber.StatusInternalServerError, "No default storage configuration found")
+			return httperr.New(http.StatusInternalServerError, "No default storage configuration found")
 		}
 
 		// Create the initial database record
 		if err := tx.Create(paste).Error; err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "Failed to save paste")
+			return httperr.New(http.StatusInternalServerError, "Failed to save paste")
 		}
 
 		// Generate filename
@@ -779,7 +799,7 @@ func (s *PasteService) createPaste(content io.Reader, apiKey *models.APIKey, siz
 		var err error
 		storagePath, err = s.storage.Put(filename, bytes.NewReader(contentBytes))
 		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, "Failed to store content")
+			return httperr.New(http.StatusInternalServerError, "Failed to store content")
 		}
 
 		// Update the paste with the storage path
@@ -787,7 +807,7 @@ func (s *PasteService) createPaste(content io.Reader, apiKey *models.APIKey, siz
 		if err := tx.Save(paste).Error; err != nil {
 			// Try to cleanup the stored content since we couldn't update the record
 			_ = s.storage.Delete(storagePath)
-			return fiber.NewError(fiber.StatusInternalServerError, "Failed to update paste")
+			return httperr.New(http.StatusInternalServerError, "Failed to update paste")
 		}
 
 		return nil
@@ -852,11 +872,11 @@ func (s *PasteService) calculateExpiry(opts ExpiryOptions) (*time.Time, error) {
 	if opts.ExpiresAt != nil {
 		now := time.Now()
 		if opts.ExpiresAt.Before(now) {
-			return nil, fiber.NewError(fiber.StatusBadRequest, "Expiration time must be in the future")
+			return nil, httperr.New(http.StatusBadRequest, "Expiration time must be in the future")
 		}
 		requestedDuration := hdur.Sub(*opts.ExpiresAt, now)
 		if requestedDuration.Days > maxDuration.Days {
-			return nil, fiber.NewError(fiber.StatusBadRequest,
+			return nil, httperr.New(http.StatusBadRequest,
 				fmt.Sprintf("Maximum allowed expiry for this file size is %.1f days", float64(maxDuration.Days)))
 		}
 		return opts.ExpiresAt, nil
@@ -864,7 +884,7 @@ func (s *PasteService) calculateExpiry(opts ExpiryOptions) (*time.Time, error) {
 
 	if opts.ExpiresIn != nil {
 		if opts.ExpiresIn.Days > maxDuration.Days {
-			return nil, fiber.NewError(fiber.StatusBadRequest,
+			return nil, httperr.New(http.StatusBadRequest,
 				fmt.Sprintf("Maximum allowed expiry for this file size is %.1f days", float64(maxDuration.Days)))
 		}
 		expiryTime := opts.ExpiresIn.Add(time.Now())
@@ -893,4 +913,12 @@ func (s *PasteService) calculateMaxRetention(size int64, hasAPIKey bool) float64
 
 	// Linear interpolation between min and max age based on size ratio
 	return retention.MinAge + (retention.MaxAge-retention.MinAge)*(1-sizeRatio)
+}
+
+// GetContent returns the stored bytes for a paste.
+//
+// The preview handler needs the raw content without writing it to the
+// response, so it reads through this instead of round-tripping a response.
+func (s *PasteService) GetContent(paste *models.Paste) ([]byte, error) {
+	return s.storage.Get(paste.StoragePath)
 }

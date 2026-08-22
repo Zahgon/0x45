@@ -1,10 +1,11 @@
 package handlers
 
 import (
-	"github.com/gofiber/fiber/v2"
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
 	"github.com/watzon/0x45/internal/config"
 	"github.com/watzon/0x45/internal/server/services"
-	"go.uber.org/zap"
 )
 
 type APIKeyHandlers struct {
@@ -28,12 +29,12 @@ func NewAPIKeyHandlers(services *services.Services, logger *zap.Logger, config *
 // @Produce json
 // @Param request body services.APIKeyRequest true "Request a new API key"
 // @Success 200 {object} services.APIKeyResponse
-// @Failure 400 {object} fiber.Error
+// @Failure 400 {object} httperr.Error
 // @Router /api/keys/request [post]
-func (h *APIKeyHandlers) HandleRequestAPIKey(c *fiber.Ctx) error {
+func (h *APIKeyHandlers) HandleRequestAPIKey(c *gin.Context) error {
 	return h.services.APIKey.RequestKey(c)
 }
 
-func (h *APIKeyHandlers) HandleVerifyAPIKey(c *fiber.Ctx) error {
+func (h *APIKeyHandlers) HandleVerifyAPIKey(c *gin.Context) error {
 	return h.services.APIKey.VerifyKey(c)
 }

@@ -1,15 +1,18 @@
 package middleware
 
 import (
+	"net/http"
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/watzon/0x45/internal/config"
-	"github.com/watzon/0x45/internal/models"
-	"github.com/watzon/0x45/internal/server/services"
+	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+
+	"github.com/watzon/0x45/internal/config"
+	"github.com/watzon/0x45/internal/httperr"
+	"github.com/watzon/0x45/internal/models"
+	"github.com/watzon/0x45/internal/server/services"
 )
 
 type AuthMiddleware struct {
@@ -29,10 +32,10 @@ func NewAuthMiddleware(db *gorm.DB, logger *zap.Logger, config *config.Config, s
 }
 
 // Auth returns a middleware that validates API keys
-func (m *AuthMiddleware) Auth(required bool) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+func (m *AuthMiddleware) Auth(required bool) gin.HandlerFunc {
+	return httperr.Wrap(func(c *gin.Context) error {
 		// First try to get API key from Authorization header
-		auth := c.Get("Authorization")
+		auth := c.GetHeader("Authorization")
 		apiKey := ""
 
 		if strings.HasPrefix(auth, "Bearer ") {
@@ -45,24 +48,27 @@ func (m *AuthMiddleware) Auth(required bool) fiber.Handler {
 		// If no API key found in either place
 		if apiKey == "" {
 			if required {
-				return fiber.NewError(fiber.StatusUnauthorized, "API key required")
+				return httperr.New(http.StatusUnauthorized, "API key required")
 			}
-			return c.Next()
+			c.Next()
+			return nil
 		}
 
 		// Validate API key and set rate limits
 		key, err := m.validateAPIKey(apiKey)
 		if err != nil {
 			if required {
-				return fiber.NewError(fiber.StatusUnauthorized, "Invalid API key")
+				return httperr.New(http.StatusUnauthorized, "Invalid API key")
 			}
-			return c.Next()
+			c.Next()
+			return nil
 		}
 
 		// Store API key in context
-		c.Locals("apiKey", key)
-		return c.Next()
-	}
+		c.Set("apiKey", key)
+		c.Next()
+		return nil
+	})
 }
 
 func (m *AuthMiddleware) validateAPIKey(key string) (*models.APIKey, error) {
@@ -73,7 +79,7 @@ func (m *AuthMiddleware) validateAPIKey(key string) (*models.APIKey, error) {
 	}
 
 	// if apiKey.ExpiresAt != nil && apiKey.ExpiresAt.Before(time.Now()) {
-	// 	return nil, fiber.NewError(fiber.StatusUnauthorized, "API key has expired")
+	// 	return nil, httperr.New(http.StatusUnauthorized, "API key has expired")
 	// }
 
 	// Update last used timestamp and usage count

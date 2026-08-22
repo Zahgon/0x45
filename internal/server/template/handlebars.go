@@ -3,19 +3,45 @@ package template
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/template/handlebars/v2"
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/render"
 	"github.com/mailgun/raymond/v2"
 	"go.uber.org/zap"
 )
 
-// MultiHandlebars is a custom handlebars engine that supports multiple template directories
+// htmlContentType is the Content-Type emitted for every rendered view.
+var htmlContentType = []string{"text/html; charset=utf-8"}
+
+// Binding carries the view data together with the layout that should wrap it.
+// gin's HTMLRender only passes a single object to Instance, so the layout name
+// travels alongside the data instead of as a separate argument.
+type Binding struct {
+	Data   map[string]any
+	Layout string
+}
+
+// WithLayout pairs view data with the layout used to wrap it.
+func WithLayout(data map[string]any, layout string) Binding {
+	return Binding{Data: data, Layout: layout}
+}
+
+// MultiHandlebars is a custom handlebars engine that supports multiple template directories.
+// It implements gin's render.HTMLRender interface.
 type MultiHandlebars struct {
-	*handlebars.Engine
+	// Directory is the primary template directory.
+	Directory string
+	// Extension is the template file extension, including the leading dot.
+	Extension string
+	// Templates holds every parsed template, keyed by its path relative to the
+	// directory it was loaded from (layouts are additionally keyed without the
+	// extension).
+	Templates map[string]*raymond.Template
+
 	fallbackDir string
 	logger      *zap.Logger
 }
@@ -44,14 +70,14 @@ func New(viewsDir, fallbackDir string, extension string, logger *zap.Logger) *Mu
 		zap.String("views_dir", absViewsDir),
 		zap.String("fallback_dir", absFallbackDir))
 
-	baseEngine := handlebars.New(absViewsDir, extension)
-	baseEngine.Templates = make(map[string]*raymond.Template)
-
-	// Register helpers
+	// Register helpers. raymond's helper registry is process global, so drop any
+	// previous registration first to stay re-entrant.
+	raymond.RemoveHelper("startsWith")
 	raymond.RegisterHelper("startsWith", func(str, prefix string) bool {
 		return strings.HasPrefix(str, prefix)
 	})
 
+	raymond.RemoveHelper("or")
 	raymond.RegisterHelper("or", func(args ...interface{}) bool {
 		for _, arg := range args {
 			// Convert to boolean and check if true
@@ -77,12 +103,15 @@ func New(viewsDir, fallbackDir string, extension string, logger *zap.Logger) *Mu
 		return false
 	})
 
+	raymond.RemoveHelper("eq")
 	raymond.RegisterHelper("eq", func(a, b interface{}) bool {
 		return a == b
 	})
 
 	engine := &MultiHandlebars{
-		Engine:      baseEngine,
+		Directory:   absViewsDir,
+		Extension:   extension,
+		Templates:   make(map[string]*raymond.Template),
 		fallbackDir: absFallbackDir,
 		logger:      logger,
 	}
@@ -112,7 +141,7 @@ func (e *MultiHandlebars) loadFromDir(dir string) error {
 		}
 
 		// Skip if not a file or doesn't have the right extension
-		if info.IsDir() || !strings.HasSuffix(path, e.Engine.Extension) {
+		if info.IsDir() || !strings.HasSuffix(path, e.Extension) {
 			return nil
 		}
 
@@ -123,7 +152,7 @@ func (e *MultiHandlebars) loadFromDir(dir string) error {
 		}
 
 		// Skip if template already exists (for fallback directory)
-		if e.Engine.Templates[rel] != nil {
+		if e.Templates[rel] != nil {
 			e.logger.Debug("template already exists, skipping",
 				zap.String("path", path),
 				zap.String("rel_path", rel))
@@ -144,7 +173,10 @@ func (e *MultiHandlebars) loadFromDir(dir string) error {
 
 		// Register partials
 		if strings.Contains(rel, "partials/") {
-			name := strings.TrimSuffix(rel, e.Engine.Extension)
+			name := strings.TrimSuffix(rel, e.Extension)
+			// raymond's partial registry is process global and panics on a
+			// duplicate name, so drop any previous registration first.
+			raymond.RemovePartial(name)
 			raymond.RegisterPartial(name, string(buf))
 			e.logger.Debug("registered partial",
 				zap.String("name", name),
@@ -153,15 +185,15 @@ func (e *MultiHandlebars) loadFromDir(dir string) error {
 
 		// Register layouts
 		if strings.Contains(rel, "layouts/") {
-			name := strings.TrimSuffix(rel, e.Engine.Extension)
-			e.Engine.Templates[name] = tmpl
+			name := strings.TrimSuffix(rel, e.Extension)
+			e.Templates[name] = tmpl
 			e.logger.Debug("registered layout",
 				zap.String("name", name),
 				zap.String("path", path))
 		}
 
 		// Register regular templates
-		e.Engine.Templates[rel] = tmpl
+		e.Templates[rel] = tmpl
 		e.logger.Debug("registered template",
 			zap.String("rel_path", rel),
 			zap.String("path", path))
@@ -170,14 +202,14 @@ func (e *MultiHandlebars) loadFromDir(dir string) error {
 	})
 }
 
-// Load implements the template.Engine interface
+// Load parses every template from the primary and fallback directories.
 func (e *MultiHandlebars) Load() error {
 	e.logger.Info("loading templates")
 
 	// First load templates from the primary directory
-	if err := e.loadFromDir(e.Engine.Directory); err != nil {
+	if err := e.loadFromDir(e.Directory); err != nil {
 		e.logger.Error("failed to load templates from primary directory",
-			zap.String("dir", e.Engine.Directory),
+			zap.String("dir", e.Directory),
 			zap.Error(err))
 		return err
 	}
@@ -200,7 +232,7 @@ func (e *MultiHandlebars) Load() error {
 
 	missingTemplates := []string{}
 	for _, tmpl := range requiredTemplates {
-		if e.Engine.Templates[tmpl] == nil {
+		if e.Templates[tmpl] == nil {
 			missingTemplates = append(missingTemplates, tmpl)
 		}
 	}
@@ -212,11 +244,11 @@ func (e *MultiHandlebars) Load() error {
 	}
 
 	e.logger.Info("finished loading templates",
-		zap.Int("total_templates", len(e.Engine.Templates)))
+		zap.Int("total_templates", len(e.Templates)))
 
 	// Log all loaded templates at debug level
-	templates := make([]string, 0, len(e.Engine.Templates))
-	for name := range e.Engine.Templates {
+	templates := make([]string, 0, len(e.Templates))
+	for name := range e.Templates {
 		templates = append(templates, name)
 	}
 	e.logger.Debug("loaded templates", zap.Strings("templates", templates))
@@ -224,7 +256,49 @@ func (e *MultiHandlebars) Load() error {
 	return nil
 }
 
-// Render implements the template.Engine interface
+// Instance implements gin's render.HTMLRender interface. The data may either be
+// a Binding (view data plus layout) or a plain map, in which case no layout is
+// applied.
+func (e *MultiHandlebars) Instance(name string, data any) render.Render {
+	binding, ok := data.(Binding)
+	if !ok {
+		if m, isMap := data.(map[string]any); isMap {
+			binding = Binding{Data: m}
+		} else {
+			binding = Binding{Data: map[string]any{}}
+		}
+	}
+
+	return &htmlRender{engine: e, name: name, binding: binding}
+}
+
+// htmlRender renders a single view through the handlebars engine.
+type htmlRender struct {
+	engine  *MultiHandlebars
+	name    string
+	binding Binding
+}
+
+// Render writes the rendered view to the response.
+func (r *htmlRender) Render(w http.ResponseWriter) error {
+	r.WriteContentType(w)
+
+	if r.binding.Layout == "" {
+		return r.engine.Render(w, r.name, r.binding.Data)
+	}
+	return r.engine.Render(w, r.name, r.binding.Data, r.binding.Layout)
+}
+
+// WriteContentType sets the HTML content type on the response.
+func (r *htmlRender) WriteContentType(w http.ResponseWriter) {
+	header := w.Header()
+	if len(header["Content-Type"]) == 0 {
+		header["Content-Type"] = htmlContentType
+	}
+}
+
+// Render executes a template, optionally wrapped in a layout, and writes the
+// result to out.
 func (e *MultiHandlebars) Render(out io.Writer, template string, binding interface{}, layout ...string) error {
 	e.logger.Debug("rendering template",
 		zap.String("template", template),
@@ -232,19 +306,19 @@ func (e *MultiHandlebars) Render(out io.Writer, template string, binding interfa
 		zap.Any("binding", binding))
 
 	// Get the template
-	tmpl := e.Engine.Templates[template+e.Engine.Extension]
+	tmpl := e.Templates[template+e.Extension]
 	if tmpl == nil {
 		e.logger.Error("template not found",
 			zap.String("template", template),
-			zap.String("extension", e.Engine.Extension))
+			zap.String("extension", e.Extension))
 		return fmt.Errorf("template %s not found", template)
 	}
 
 	// If layout is specified, wrap the content in the layout
 	var content interface{}
 	if len(layout) > 0 && layout[0] != "" {
-		layoutName := layout[0] + e.Engine.Extension
-		layoutTmpl := e.Engine.Templates[layoutName]
+		layoutName := layout[0] + e.Extension
+		layoutTmpl := e.Templates[layoutName]
 		if layoutTmpl == nil {
 			e.logger.Error("layout not found",
 				zap.String("layout", layoutName))
@@ -261,11 +335,11 @@ func (e *MultiHandlebars) Render(out io.Writer, template string, binding interfa
 		}
 
 		// Create layout binding with the template result
-		layoutBinding := fiber.Map{
+		layoutBinding := map[string]any{
 			"embed": raymond.SafeString(result),
 		}
 		// Add all original binding values to layout binding
-		if m, ok := binding.(fiber.Map); ok {
+		if m, ok := binding.(map[string]any); ok {
 			for k, v := range m {
 				layoutBinding[k] = v
 			}
@@ -288,4 +362,18 @@ func (e *MultiHandlebars) Render(out io.Writer, template string, binding interfa
 
 	_, err = out.Write([]byte(result))
 	return err
+}
+
+// Render writes a handlebars view to the response with the standard 200 status.
+//
+// gin's c.HTML only accepts a single data object, so the optional layout is
+// folded into a Binding here. This keeps the layout selection at the call site,
+// the way the views expect it.
+func Render(c *gin.Context, name string, data map[string]any, layout ...string) error {
+	binding := Binding{Data: data}
+	if len(layout) > 0 {
+		binding.Layout = layout[0]
+	}
+	c.HTML(http.StatusOK, name, binding)
+	return nil
 }

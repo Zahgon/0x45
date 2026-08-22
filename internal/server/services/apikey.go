@@ -3,14 +3,20 @@ package services
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"github.com/watzon/0x45/internal/server/respond"
+	"net/http"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/watzon/0x45/internal/config"
-	"github.com/watzon/0x45/internal/mailer"
-	"github.com/watzon/0x45/internal/models"
+	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+
+	"github.com/watzon/0x45/internal/config"
+	"github.com/watzon/0x45/internal/httperr"
+	"github.com/watzon/0x45/internal/mailer"
+	"github.com/watzon/0x45/internal/models"
+	"github.com/watzon/0x45/internal/server/binding"
+	"github.com/watzon/0x45/internal/server/template"
 )
 
 type APIKeyService struct {
@@ -35,16 +41,16 @@ func NewAPIKeyService(db *gorm.DB, logger *zap.Logger, config *config.Config) *A
 }
 
 // RequestKey handles the initial API key request
-func (s *APIKeyService) RequestKey(c *fiber.Ctx) error {
+func (s *APIKeyService) RequestKey(c *gin.Context) error {
 	var req APIKeyRequest
 
-	if err := c.BodyParser(&req); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
+	if err := binding.Body(c, &req); err != nil {
+		return httperr.New(http.StatusBadRequest, "Invalid request body")
 	}
 
 	// Validate email
 	if req.Email == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "Email is required")
+		return httperr.New(http.StatusBadRequest, "Email is required")
 	}
 
 	// Check for existing unverified key
@@ -59,7 +65,7 @@ func (s *APIKeyService) RequestKey(c *fiber.Ctx) error {
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		s.logger.Error("failed to generate verification token", zap.Error(err))
-		return fiber.NewError(fiber.StatusInternalServerError, "Failed to generate verification token")
+		return httperr.New(http.StatusInternalServerError, "Failed to generate verification token")
 	}
 	token := hex.EncodeToString(tokenBytes)
 
@@ -74,7 +80,7 @@ func (s *APIKeyService) RequestKey(c *fiber.Ctx) error {
 
 	if err := s.db.Create(apiKey).Error; err != nil {
 		s.logger.Error("failed to create API key", zap.Error(err))
-		return fiber.NewError(fiber.StatusInternalServerError, "Failed to create API key")
+		return httperr.New(http.StatusInternalServerError, "Failed to create API key")
 	}
 
 	// Send verification email
@@ -83,26 +89,28 @@ func (s *APIKeyService) RequestKey(c *fiber.Ctx) error {
 			zap.String("email", req.Email),
 			zap.Error(err),
 		)
-		return fiber.NewError(fiber.StatusInternalServerError, "Failed to send verification email. Please contact the administrator.")
+		return httperr.New(http.StatusInternalServerError, "Failed to send verification email. Please contact the administrator.")
 	}
 
-	return c.JSON(fiber.Map{
+	respond.JSON(c, http.StatusOK, gin.H{
 		"message": "API key created. Please check your email for verification.",
 	})
+
+	return nil
 }
 
 // VerifyKey verifies the email and activates the API key
-func (s *APIKeyService) VerifyKey(c *fiber.Ctx) error {
+func (s *APIKeyService) VerifyKey(c *gin.Context) error {
 	token := c.Query("token")
 	if token == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "Verification token is required")
+		return httperr.New(http.StatusBadRequest, "Verification token is required")
 	}
 
 	var apiKey models.APIKey
 	err := s.db.Where("verify_token = ? AND verified = ? AND verify_expiry > ?", token, false, time.Now()).First(&apiKey).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
-			return fiber.NewError(fiber.StatusNotFound, "Invalid or expired verification token")
+			return httperr.New(http.StatusNotFound, "Invalid or expired verification token")
 		}
 		return err
 	}
@@ -114,10 +122,10 @@ func (s *APIKeyService) VerifyKey(c *fiber.Ctx) error {
 	apiKey.UsageCount = 0            // Initialize UsageCount
 
 	if err := s.db.Save(&apiKey).Error; err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "Failed to verify API key")
+		return httperr.New(http.StatusInternalServerError, "Failed to verify API key")
 	}
 
-	return c.Render("verify_success", fiber.Map{
+	return template.Render(c, "verify_success", gin.H{
 		"baseUrl": s.config.Server.BaseURL,
 		"apiKey":  apiKey.Key,
 	}, "layouts/main")
@@ -135,8 +143,8 @@ func (s *APIKeyService) IsEnabled() bool {
 
 func (s *APIKeyService) sendVerificationEmail(email, token string) error {
 	if s.mailer == nil {
-		return fiber.NewError(
-			fiber.StatusServiceUnavailable,
+		return httperr.New(
+			http.StatusServiceUnavailable,
 			"Email verification is not available. Please contact the administrator.",
 		)
 	}

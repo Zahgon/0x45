@@ -71,7 +71,7 @@ func TestMultipartCreateShortlink(t *testing.T) {
 			}
 
 			// Perform request
-			resp, err := env.App.Test(req)
+			resp, err := env.Request(req)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectedStatus, resp.StatusCode)
 

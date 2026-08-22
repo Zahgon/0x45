@@ -1,13 +1,13 @@
 package handlers
 
-import "github.com/gofiber/fiber/v2"
+import "github.com/gin-gonic/gin"
 
 // getPasteID extracts paste ID from request parameters
-func getPasteID(c *fiber.Ctx) string {
+func getPasteID(c *gin.Context) string {
 	// First try the :id parameter
-	if id := c.Params("id"); id != "" {
+	if id := c.Param("id"); id != "" {
 		return id
 	}
 	// Then try the path parameter
-	return c.Params("*")
+	return c.Param("*")
 }

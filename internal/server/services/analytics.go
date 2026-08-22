@@ -3,11 +3,12 @@ package services
 import (
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/watzon/0x45/internal/config"
-	"github.com/watzon/0x45/internal/models"
+	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+
+	"github.com/watzon/0x45/internal/config"
+	"github.com/watzon/0x45/internal/models"
 )
 
 type AnalyticsService struct {
@@ -117,23 +118,23 @@ func (s *AnalyticsService) GetResourceStats(resourceType string, resourceID stri
 }
 
 // LogEvent creates a new analytics event with common request information
-func (s *AnalyticsService) LogEvent(c *fiber.Ctx, eventType models.EventType, resourceType string, resourceID string) error {
+func (s *AnalyticsService) LogEvent(c *gin.Context, eventType models.EventType, resourceType string, resourceID string) error {
 	// Get request information
-	userAgent := c.Get("User-Agent")
-	ipAddress := c.IP()
-	refererURL := c.Get("Referer")
+	userAgent := c.GetHeader("User-Agent")
+	ipAddress := c.ClientIP()
+	refererURL := c.GetHeader("Referer")
 
 	// Create event with request context
 	return models.CreateEvent(s.db, eventType, resourceType, resourceID, userAgent, ipAddress, refererURL)
 }
 
 // LogPasteView creates an analytics event for paste views
-func (s *AnalyticsService) LogPasteView(c *fiber.Ctx, pasteID string) error {
+func (s *AnalyticsService) LogPasteView(c *gin.Context, pasteID string) error {
 	return s.LogEvent(c, models.EventPasteView, "paste", pasteID)
 }
 
 // LogShortlinkClick creates an analytics event for shortlink clicks
-func (s *AnalyticsService) LogShortlinkClick(c *fiber.Ctx, shortlinkID string) error {
+func (s *AnalyticsService) LogShortlinkClick(c *gin.Context, shortlinkID string) error {
 	return s.LogEvent(c, models.EventShortlinkClick, "shortlink", shortlinkID)
 }
 

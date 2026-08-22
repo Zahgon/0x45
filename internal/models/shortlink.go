@@ -5,9 +5,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/watzon/0x45/internal/utils"
 	"gorm.io/gorm"
+
+	"github.com/watzon/0x45/internal/utils"
 )
 
 type Shortlink struct {
@@ -39,8 +39,8 @@ func (s *Shortlink) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
-func (s *Shortlink) ToResponse(baseURL string) fiber.Map {
-	response := fiber.Map{
+func (s *Shortlink) ToResponse(baseURL string) map[string]any {
+	response := map[string]any{
 		"id":         s.ID,
 		"url":        s.TargetURL,
 		"title":      s.Title,

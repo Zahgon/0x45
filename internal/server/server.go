@@ -3,26 +3,30 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/gabriel-vasile/mimetype"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gin-gonic/gin"
 	"github.com/watzon/0x45/internal/config"
 	"github.com/watzon/0x45/internal/database"
+	"github.com/watzon/0x45/internal/httperr"
 	"github.com/watzon/0x45/internal/server/handlers"
 	"github.com/watzon/0x45/internal/server/middleware"
+	"github.com/watzon/0x45/internal/server/respond"
 	"github.com/watzon/0x45/internal/server/services"
 	"github.com/watzon/0x45/internal/server/template"
 	"github.com/watzon/0x45/internal/storage"
-	"github.com/watzon/hdur"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
 type Server struct {
-	app        *fiber.App
+	app        *gin.Engine
+	handler    http.Handler
+	http       *http.Server
+	routesOnce sync.Once
 	db         *database.Database
 	storage    *storage.StorageManager
 	config     *config.Config
@@ -45,18 +49,6 @@ func New(config *config.Config, logger *zap.Logger) *Server {
 		}
 		return false
 	}, "text/markdown", ".md", ".markdown")
-
-	// Custom parsers for fiber
-	fiber.SetParserDecoder(fiber.ParserConfig{
-		IgnoreUnknownKeys: true,
-		ZeroEmpty:         true,
-		ParserType: []fiber.ParserType{
-			{
-				Customtype: hdur.Duration{},
-				Converter:  services.HdurDurationConverter,
-			},
-		},
-	})
 
 	// Initialize database
 	db, err := database.New(config, &gorm.Config{
@@ -89,26 +81,48 @@ func New(config *config.Config, logger *zap.Logger) *Server {
 	// Initialize handlers
 	hdl := handlers.NewHandlers(db.DB, logger, config, svc)
 
-	// Initialize Fiber app
-	app := fiber.New(fiber.Config{
-		ErrorHandler: errorHandler,
-		BodyLimit:    int(config.Server.MaxUploadSize),
-		Views:        engine,
-		Prefork:      config.Server.Prefork,
-		ServerHeader: config.Server.ServerHeader,
-		AppName:      config.Server.AppName,
-		ProxyHeader:  fiber.HeaderXForwardedFor,
+	// Initialize the gin engine
+	gin.SetMode(gin.ReleaseMode)
+	app := gin.New()
+	app.HTMLRender = engine
+
+	// Trust X-Forwarded-For for client IPs, the equivalent of Fiber's ProxyHeader.
+	app.ForwardedByClientIP = true
+	if err := app.SetTrustedProxies(nil); err != nil {
+		logger.Error("failed to configure trusted proxies", zap.Error(err))
+	}
+	app.RemoteIPHeaders = []string{"X-Forwarded-For"}
+
+	// Fiber answered unmatched paths and rejected verbs through its ErrorHandler,
+	// so both came back as JSON. gin renders plain text and leaves 405 off by
+	// default, so the two cases are wired back to the original payloads here.
+	app.HandleMethodNotAllowed = true
+	app.NoRoute(func(c *gin.Context) {
+		respond.AbortJSON(c, http.StatusNotFound, gin.H{
+			"error": fmt.Sprintf("Cannot %s %s", c.Request.Method, c.Request.URL.Path),
+		})
+	})
+	app.NoMethod(func(c *gin.Context) {
+		respond.AbortJSON(c, http.StatusMethodNotAllowed, gin.H{"error": "Method Not Allowed"})
 	})
 
-	// Add all middleware in the correct order
-	for _, middleware := range mw.GetMiddleware() {
-		app.Use(middleware)
+	// Fiber advertised itself through Config.ServerHeader; gin has no such
+	// option, so the header is written by a middleware instead.
+	if config.Server.ServerHeader != "" {
+		serverHeader := config.Server.ServerHeader
+		app.Use(func(c *gin.Context) {
+			c.Header("Server", serverHeader)
+			c.Next()
+		})
 	}
+
+	// Add all middleware in the correct order
+	app.Use(mw.GetMiddleware()...)
 
 	// Serve static files
 	app.Static("/public", config.Server.PublicDirectory)
 
-	return &Server{
+	server := &Server{
 		app:        app,
 		db:         db,
 		storage:    storageManager,
@@ -118,111 +132,145 @@ func New(config *config.Config, logger *zap.Logger) *Server {
 		handlers:   hdl,
 		middleware: mw,
 	}
+
+	// Fiber applied the body limit and the _method override before routing.
+	// gin middleware only runs after a route matches, so both live in an
+	// http.Handler that wraps the engine.
+	server.handler = withMethodOverride(withBodyLimit(app, int64(config.Server.MaxUploadSize)))
+
+	return server
 }
 
-// SetupMiddleware configures all the middleware for the server
-func (s *Server) SetupMiddleware() {
-	// Add method override middleware
-	s.app.Use(func(c *fiber.Ctx) error {
-		// Check if this is a POST request with _method parameter
-		if c.Method() == "POST" {
-			method := c.FormValue("_method")
-			if method != "" {
-				c.Method(strings.ToUpper(method))
+// withBodyLimit rejects payloads larger than the configured upload size, the
+// replacement for Fiber's Config.BodyLimit.
+func withBodyLimit(next http.Handler, limit int64) http.Handler {
+	if limit <= 0 {
+		return next
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > limit {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":"Request Entity Too Large"}`))
+			return
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withMethodOverride lets HTML forms emulate PUT and DELETE through a _method
+// field. Fiber could rewrite the method from a middleware because it matched
+// routes lazily; gin resolves the route first, so the rewrite has to happen
+// before the engine sees the request.
+func withMethodOverride(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			contentType := r.Header.Get("Content-Type")
+			if strings.HasPrefix(contentType, "application/x-www-form-urlencoded") ||
+				strings.HasPrefix(contentType, "multipart/form-data") {
+				// PostFormValue parses the body once and caches it, so the
+				// handlers still see the form fields and uploaded files.
+				if method := r.PostFormValue("_method"); method != "" {
+					r.Method = strings.ToUpper(method)
+				}
 			}
 		}
-		return c.Next()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SetupRoutes configures all the routes for the server. It is safe to call
+// more than once; gin panics when a route is registered twice.
+func (s *Server) SetupRoutes() {
+	s.routesOnce.Do(s.registerRoutes)
+}
+
+// SetupMiddleware configures all the middleware for the server.
+//
+// The _method override Fiber registered here now lives in the http.Handler
+// wrapper built by New, because gin resolves routes before middleware runs.
+func (s *Server) SetupMiddleware() {
+	// Setup CORS
+	s.app.Use(func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		if c.Request.Method == http.MethodOptions {
+			c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept")
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
 	})
 
-	// Setup CORS
-	s.app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin, Content-Type, Accept",
-	}))
-
 	// Add request logging
-	s.app.Use(logger.New(logger.Config{
-		Format: "${time} ${ip} ${status} ${latency} ${method} ${path}\n",
+	s.app.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return fmt.Sprintf("%s %s %d %s %s %s\n",
+			param.TimeStamp.Format("2006/01/02 15:04:05"),
+			param.ClientIP,
+			param.StatusCode,
+			param.Latency,
+			param.Method,
+			param.Path,
+		)
 	}))
 }
 
-// SetupRoutes configures all the routes for the server
-func (s *Server) SetupRoutes() {
+func (s *Server) registerRoutes() {
 	// Setup middleware first
 	s.SetupMiddleware()
 
 	// Web interface routes
-	s.app.Get("/", s.handlers.Web.HandleIndex)
-	s.app.Get("/stats", s.handlers.Web.HandleStats)
-	s.app.Get("/docs", s.handlers.Web.HandleDocs)
-	s.app.Get("/submit", s.handlers.Web.HandleSubmit)
+	s.app.GET("/", httperr.Wrap(s.handlers.Web.HandleIndex))
+	s.app.GET("/stats", httperr.Wrap(s.handlers.Web.HandleStats))
+	s.app.GET("/docs", httperr.Wrap(s.handlers.Web.HandleDocs))
+	s.app.GET("/submit", httperr.Wrap(s.handlers.Web.HandleSubmit))
 
 	// API Key routes
 	keys := s.app.Group("/keys")
-	keys.Post("/request", s.handlers.APIKey.HandleRequestAPIKey)
-	keys.Get("/verify", s.handlers.APIKey.HandleVerifyAPIKey)
+	keys.POST("/request", httperr.Wrap(s.handlers.APIKey.HandleRequestAPIKey))
+	keys.GET("/verify", httperr.Wrap(s.handlers.APIKey.HandleVerifyAPIKey))
 
 	// URL redirect route - must be before the group to avoid auth middleware
-	s.app.Get("/u/:id", s.handlers.URL.HandleRedirect)
+	s.app.GET("/u/:id", httperr.Wrap(s.handlers.URL.HandleRedirect))
 
 	// URL management routes
 	urls := s.app.Group("/u")
 	urls.Use(s.middleware.Auth.Auth(true))
-	urls.Post("/", s.handlers.URL.HandleURLShorten)
-	urls.Get("/list", s.handlers.URL.HandleListURLs)
-	urls.Get("/:id/stats", s.handlers.URL.HandleURLStats)
-	urls.Delete("/:id", s.handlers.URL.HandleDeleteURL)
-	urls.Put("/:id/expiry", s.handlers.URL.HandleUpdateURLExpiration)
+	urls.POST("/", httperr.Wrap(s.handlers.URL.HandleURLShorten))
+	urls.GET("/list", httperr.Wrap(s.handlers.URL.HandleListURLs))
+	urls.GET("/:id/stats", httperr.Wrap(s.handlers.URL.HandleURLStats))
+	urls.DELETE("/:id", httperr.Wrap(s.handlers.URL.HandleDeleteURL))
+	urls.PUT("/:id/expiry", httperr.Wrap(s.handlers.URL.HandleUpdateURLExpiration))
 
 	// Paste routes - authenticated routes first
 	pastes := s.app.Group("/p")
-	pastes.Post("/", s.middleware.Auth.Auth(false), s.handlers.Paste.HandleUpload)
-	pastes.Get("/list", s.middleware.Auth.Auth(true), s.handlers.Paste.HandleListPastes)
-	pastes.Delete("/:id", s.middleware.Auth.Auth(false), s.handlers.Paste.HandleDeletePaste)
-	pastes.Put("/:id/expiry", s.middleware.Auth.Auth(true), s.handlers.Paste.HandleUpdateExpiration)
+	pastes.POST("/", s.middleware.Auth.Auth(false), httperr.Wrap(s.handlers.Paste.HandleUpload))
+	pastes.GET("/list", s.middleware.Auth.Auth(true), httperr.Wrap(s.handlers.Paste.HandleListPastes))
+	pastes.DELETE("/:id", s.middleware.Auth.Auth(false), httperr.Wrap(s.handlers.Paste.HandleDeletePaste))
+	pastes.PUT("/:id/expiry", s.middleware.Auth.Auth(true), httperr.Wrap(s.handlers.Paste.HandleUpdateExpiration))
 
-	// Public paste routes - extension routes first (more specific)
-	s.app.Get("/p/:id.:ext", func(c *fiber.Ctx) error {
-		c.Locals("extension", c.Params("ext"))
-		return s.handlers.Paste.HandleView(c)
-	})
-	s.app.Get("/p/:id/raw.:ext", func(c *fiber.Ctx) error {
-		c.Locals("extension", c.Params("ext"))
-		return s.handlers.Paste.HandleRawView(c)
-	})
-	s.app.Get("/p/:id/download.:ext", func(c *fiber.Ctx) error {
-		c.Locals("extension", c.Params("ext"))
-		return s.handlers.Paste.HandleDownload(c)
-	})
-	s.app.Get("/p/:id.:ext/image", func(c *fiber.Ctx) error {
-		c.Locals("extension", c.Params("ext"))
-		return s.handlers.Paste.HandleGetPasteImage(c)
-	})
+	// Public paste routes.
+	//
+	// Fiber also declared /p/:id.:ext, /p/:id/raw.:ext, /p/:id/download.:ext
+	// and /p/:id.:ext/image. gin allows only one wildcard per path segment and
+	// panics on those shapes, so the extension is parsed inside the handlers:
+	//   /p/abc.txt        -> /p/:id        with id "abc.txt"
+	//   /p/abc.txt/image  -> /p/:id/image  with id "abc.txt"
+	//   /p/abc/raw.txt    -> /p/:id/:key   dispatched by HandlePasteSegment
+	// GetPaste strips the extension, so every URL form still resolves.
+	s.app.GET("/p/:id", httperr.Wrap(s.handlers.Paste.HandleView))
+	s.app.GET("/p/:id/raw", httperr.Wrap(s.handlers.Paste.HandleRawView))
+	s.app.GET("/p/:id/download", httperr.Wrap(s.handlers.Paste.HandleDownload))
+	s.app.GET("/p/:id/image", httperr.Wrap(s.handlers.Paste.HandleGetPasteImage))
+	s.app.GET("/p/:id/preview", httperr.Wrap(s.handlers.Paste.HandlePreview))
+	s.app.DELETE("/p/:id/:key", httperr.Wrap(s.handlers.Paste.HandleDeleteWithKey))
+	s.app.GET("/p/:id/:key", httperr.Wrap(s.handlers.Paste.HandlePasteSegment))
 
-	// Non-extension paste routes last (more general)
-	s.app.Get("/p/:id", s.handlers.Paste.HandleView)
-	s.app.Get("/p/:id/raw", s.handlers.Paste.HandleRawView)
-	s.app.Get("/p/:id/download", s.handlers.Paste.HandleDownload)
-	s.app.Get("/p/:id/image", s.handlers.Paste.HandleGetPasteImage)
-	s.app.Get("/p/:id/preview", s.handlers.Paste.HandlePreview)
-	s.app.Delete("/p/:id/:key", s.handlers.Paste.HandleDeleteWithKey)
-	s.app.Get("/p/:id/:key", s.handlers.Paste.HandleDeleteWithKey)
-}
-
-// Error handler
-func errorHandler(c *fiber.Ctx, err error) error {
-	code := fiber.StatusInternalServerError
-	message := "Internal Server Error"
-
-	if e, ok := err.(*fiber.Error); ok {
-		code = e.Code
-		message = e.Message
-	}
-
-	return c.Status(code).JSON(fiber.Map{
-		"error": message,
-	})
+	s.logger.Info("routes registered", zap.Int("count", len(s.app.Routes())))
 }
 
 func (s *Server) Start(addr string) error {
@@ -238,11 +286,36 @@ func (s *Server) Start(addr string) error {
 	s.SetupRoutes()
 
 	// Start server
-	return s.app.Listen(addr)
+	s.http = &http.Server{
+		Addr:    addr,
+		Handler: s.handler,
+	}
+
+	// Fiber printed Config.AppName in its startup banner; gin has no banner, so the
+	// configured app name is surfaced here instead. It was never sent on the wire.
+	s.logger.Info("server listening",
+		zap.String("address", addr),
+		zap.String("app_name", s.config.Server.AppName))
+	// fiber.Config{Prefork} re-implemented over net/http — see prefork.go.
+	if s.config.Server.Prefork {
+		return s.listenPrefork(addr)
+	}
+
+	if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
-func (s *Server) GetApp() *fiber.App {
+// GetApp returns the gin engine backing the server.
+func (s *Server) GetApp() *gin.Engine {
 	return s.app
+}
+
+// Handler returns the outermost http.Handler, including the body limit and
+// _method override that sit in front of the gin engine.
+func (s *Server) Handler() http.Handler {
+	return s.handler
 }
 
 func (s *Server) GetDB() *database.Database {
@@ -274,7 +347,10 @@ func (s *Server) GetMiddleware() *middleware.Middleware {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.app.ShutdownWithContext(ctx)
+	if s.http == nil {
+		return nil
+	}
+	return s.http.Shutdown(ctx)
 }
 
 func (s *Server) Cleanup() error {

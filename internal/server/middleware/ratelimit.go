@@ -4,11 +4,13 @@ import (
 	"context"
 	"strings"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
-	"github.com/watzon/0x45/internal/config"
-	"github.com/watzon/0x45/internal/ratelimit"
 	"go.uber.org/zap"
+
+	"github.com/watzon/0x45/internal/config"
+	"github.com/watzon/0x45/internal/httperr"
+	"github.com/watzon/0x45/internal/ratelimit"
 )
 
 type RateLimiter struct {
@@ -64,27 +66,30 @@ func NewRateLimiter(logger *zap.Logger, config *config.Config) *RateLimiter {
 }
 
 // RateLimit returns a middleware that limits requests
-func (m *RateLimiter) RateLimit() fiber.Handler {
-	return func(c *fiber.Ctx) error {
+func (m *RateLimiter) RateLimit() gin.HandlerFunc {
+	return httperr.Wrap(func(c *gin.Context) error {
 		// Skip rate limiting on non-API routes
-		if !strings.HasPrefix(c.Path(), "/api/") {
-			return c.Next()
+		if !strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.Next()
+			return nil
 		}
 
 		// Skip rate limiting if request has a valid API key
-		if c.Locals("apiKey") != nil {
-			return c.Next()
+		if _, ok := c.Get("apiKey"); ok {
+			c.Next()
+			return nil
 		}
 
 		// Use the existing rate limiter implementation
-		if err := m.limiter.Check(c.IP()); err != nil {
+		if err := m.limiter.Check(c.ClientIP()); err != nil {
 			m.logger.Warn("rate limit exceeded",
-				zap.String("ip", c.IP()),
+				zap.String("ip", c.ClientIP()),
 				zap.Error(err),
 			)
 			return err
 		}
 
-		return c.Next()
-	}
+		c.Next()
+		return nil
+	})
 }

@@ -7,10 +7,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"net/http"
+
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
+
+	"github.com/watzon/0x45/internal/httperr"
 )
 
 // RateLimiter manages both global and per-IP rate limiting
@@ -78,8 +81,8 @@ func (r *RateLimiter) checkMemory(ip string) error {
 	// Check global rate limit if enabled
 	if r.config.Global.Enabled {
 		if !r.globalLimiter.Allow() {
-			return fiber.NewError(
-				fiber.StatusTooManyRequests,
+			return httperr.New(
+				http.StatusTooManyRequests,
 				"Server is experiencing high load, please try again later",
 			)
 		}
@@ -89,8 +92,8 @@ func (r *RateLimiter) checkMemory(ip string) error {
 	if r.config.PerIP.Enabled {
 		ipLimiter := r.getIPLimiter(ip)
 		if !ipLimiter.Allow() {
-			return fiber.NewError(
-				fiber.StatusTooManyRequests,
+			return httperr.New(
+				http.StatusTooManyRequests,
 				"Rate limit exceeded, please try again later",
 			)
 		}
@@ -112,7 +115,7 @@ func (r *RateLimiter) getIPLimiter(ip string) *rate.Limiter {
 // checkRedis implements Redis-based rate limiting for prefork mode
 func (r *RateLimiter) checkRedis(ip string) error {
 	if r.redis == nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "Redis required for rate limiting in prefork mode")
+		return httperr.New(http.StatusInternalServerError, "Redis required for rate limiting in prefork mode")
 	}
 
 	ctx := context.Background()
@@ -126,11 +129,11 @@ func (r *RateLimiter) checkRedis(ip string) error {
 				zap.Float64("rate", r.config.Global.Rate),
 				zap.Int("burst", r.config.Global.Burst),
 			)
-			return fiber.NewError(fiber.StatusInternalServerError, "Rate limit check failed")
+			return httperr.New(http.StatusInternalServerError, "Rate limit check failed")
 		}
 		if !allowed {
-			return fiber.NewError(
-				fiber.StatusTooManyRequests,
+			return httperr.New(
+				http.StatusTooManyRequests,
 				"Server is experiencing high load, please try again later",
 			)
 		}
@@ -146,11 +149,11 @@ func (r *RateLimiter) checkRedis(ip string) error {
 				zap.Float64("rate", r.config.PerIP.Rate),
 				zap.Int("burst", r.config.PerIP.Burst),
 			)
-			return fiber.NewError(fiber.StatusInternalServerError, "Rate limit check failed")
+			return httperr.New(http.StatusInternalServerError, "Rate limit check failed")
 		}
 		if !allowed {
-			return fiber.NewError(
-				fiber.StatusTooManyRequests,
+			return httperr.New(
+				http.StatusTooManyRequests,
 				"Rate limit exceeded, please try again later",
 			)
 		}
